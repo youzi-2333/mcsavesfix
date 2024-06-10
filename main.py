@@ -3,6 +3,8 @@
 """
 
 from collections import Counter
+import datetime
+import json
 import os
 from pathlib import Path
 import re
@@ -25,20 +27,33 @@ def latest_modified(folder: Path):
     获取 `folder` 下最晚被修改的文件。
     """
     latest_file = None
-    latest_time = None
+    latest_time = -1.0
 
     # 遍历文件夹中的所有文件和子文件夹
     for path in folder.rglob("*"):
         # 忽略子文件夹和符号链接等
-        if path.is_file() and not path.is_symlink():
-            # 获取文件的修改时间
-            mod_time = os.path.getmtime(path)
-            # 如果没有找到文件，或者当前文件的修改时间比已找到的文件晚
-            if latest_time is None or mod_time > latest_time:
-                latest_time = mod_time
-                latest_file = path
+        if not path.is_file() or path.is_symlink():
+            continue
+        # 获取文件的修改时间
+        mod_time = os.path.getmtime(path)
+        # 如果没有找到文件，或者当前文件的修改时间比已找到的文件晚
+        if mod_time > latest_time:
+            latest_time = mod_time
+            latest_file = path
 
     return latest_file
+
+
+def askfor_select(to_select: list, hint: str):
+    """
+    让用户选择列表中的一项。
+    """
+    for i in range(len(to_select)):  # pylint: disable=C0200
+        print(f"[{i + 1}] {to_select[i]}")
+    selected = input(f"{hint}（输入编号，然后按下 Enter）：")
+    if is_int(selected) and 1 <= int(selected) <= len(to_select):
+        return to_select[int(selected) - 1]
+    return None
 
 
 class Minecraft:
@@ -50,6 +65,8 @@ class Minecraft:
     """.minecraft 路径。"""
 
     def __init__(self, path: Path) -> None:
+        if not path.is_dir():
+            raise FileNotFoundError(f"错误：未找到 .minecraft 文件夹：{path}")
         self.path = path
 
     def __iter__(self):
@@ -95,6 +112,8 @@ class Version:
         """
         if not self.path:
             raise ValueError("未指定版本路径。")
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"错误：未找到版本文件夹：{self.path}")
         return Saves(self.path / "saves")
 
     def __str__(self) -> str:
@@ -108,15 +127,35 @@ class Saves:
 
     path: Path
     """saves 文件夹路径。"""
-    versioned: bool = True
-    """是否为版本隔离存档。"""
 
-    def __init__(self, path: Path, versioned: bool = True):
+    def __init__(self, path: Path):
+        if not path.name == "saves":
+            raise ValueError(f"错误：不是有效的 saves 文件夹：{path}")
         self.path = path
-        self.versioned = versioned
 
     def __iter__(self):
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"错误：未找到 saves 文件夹：{self.path}")
         return (Save(s) for s in self.path.iterdir())
+
+    def __str__(self) -> str:
+        return "未开启版本隔离"
+
+
+class SaveFixError(Exception):
+    """
+    存档修复时出现的问题。
+    """
+
+    save: "Save"
+    """存档。"""
+
+    def __init__(self, msg: str, save: "Save") -> None:
+        self.msg = msg
+        self.save = save
+
+    def __str__(self) -> str:
+        return f"修复 {self.save} 失败：{self.msg}"
 
 
 class Save:
@@ -134,40 +173,21 @@ class Save:
         """
         修复存档。
         """
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"错误：未找到存档文件夹：{self.path}")
         print(f"正在修复存档：{self.path}")
         adv_json = latest_modified(self.path / "advancements")
         if not adv_json:
             print("该存档不需要修复！")
             return
         if adv_json and adv_json.suffix != ".json":
-            raise ValueError(f"存档中可能有个人文件，修复失败（{adv_json}）。")
+            raise SaveFixError(f"存档中可能有个人文件，修复失败（{adv_json}）。", self)
         adv_json.rename(adv_json.parent / f"{new_uuid}.json")
         print(f"{adv_json} -> {adv_json.parent / f'{new_uuid}.json'}")
         print("修复成功！")
 
     def __str__(self) -> str:
         return self.path.name
-
-
-class ListSelect:
-    """
-    让用户选择列表中的一项。
-    """
-
-    def __init__(self, to_select: list, hint_text: str = "") -> None:
-        self.to_select = to_select
-        self.hint_text = hint_text
-
-    def select(self):
-        """
-        让用户选择。
-        """
-        for i in range(len(self.to_select)):  # pylint: disable=C0200
-            print(f"[{i + 1}] {self.to_select[i]}")
-        selected = input(f"{self.hint_text}（输入编号，然后按下 Enter）：")
-        if is_int(selected):
-            return self.to_select[int(selected) - 1]
-        return None
 
 
 class UuidReader:
@@ -178,22 +198,37 @@ class UuidReader:
     POSSIBLE_BATCH = ["../PCL/LatestLaunch.bat"]
     possible_uuid = []
 
-    def __init__(self, mc_path: Path) -> None:
+    def __init__(self, mc_path: Path, usercache: Path) -> None:
         self.mc_path = mc_path
+        self.usercache = usercache
 
     def read(self):
         """
         读取 UUID。
         """
         for p in self.POSSIBLE_BATCH:
-            if not (path := self.mc_path / p).exists():
+            if not (path := self.mc_path / p).is_file():
                 continue
             with open(path, "r", encoding="ansi") as f:
                 content = f.read()
             match = re.search(r"--uuid\s+(\S+)", content)
             if not match:
                 continue
-            self.possible_uuid.append(match[0].replace("--uuid", "").strip())
+            self.possible_uuid.append((u := match[0].replace("--uuid", "").strip()))
+            print(f"[UUID] 从启动脚本获取到的 UUID：{u}")
+        if self.usercache.is_file():
+            with open(self.usercache, "r", encoding="utf-8") as f:
+                content = json.load(f)
+            if isinstance(content, dict):
+                self.possible_uuid.append(
+                    *(
+                        d["uuid"]
+                        for d in content
+                        if datetime.datetime.fromisoformat(d["expiresOn"])
+                        > datetime.datetime.now()
+                    )
+                )
+        print("[UUID] 读取到的 UUID：", self.possible_uuid)
         common = Counter(self.possible_uuid).most_common(1)
         if not common:
             return self.format(input("自动读取 UUID 失败，请手动输入 UUID："))
@@ -230,7 +265,16 @@ class Logic:
         """
         让用户选择游戏版本。
         """
-        result = ListSelect(list(self.mc), "请选择游戏版本").select()
+        version_list = ([self.mc.saves] if self.mc.saves.path.is_dir() else []) + list(
+            self.mc
+        )
+        if len(version_list) == 0:
+            print("没有游戏版本。")
+            return False
+        result = askfor_select(
+            version_list,
+            "请选择游戏版本",
+        )
         if not result:
             print("未知的游戏版本。")
             return False
@@ -247,27 +291,31 @@ class Logic:
 
     def ask_save(self):
         """
-        让用户选择存档。
+        让用户选择存档并修复。
         """
-        result = ListSelect(list(self.saves), "请选择存档").select()
+        if len(saves_list := list(self.saves)) == 0:
+            print("没有存档。")
+            return False
+        result = askfor_select(saves_list, "请选择存档")
         if not result:
             print("未知的存档。")
             return False
         if not isinstance(result, Save):
             return False
-        result.fix(UuidReader(self.mc.path).read())
+        result.fix(
+            UuidReader(
+                self.mc.path, result.path / ".." / ".." / "usercache.json"
+            ).read()
+        )
         return True
-
-    def read_uuid(self):
-        """
-        获取用户 UUID。
-        """
-        UuidReader(self.mc.path).read()
 
     def run_all(self):
         """
         运行一次程序逻辑。
         """
+        print("请尽量在修复前启动一次游戏，加载完成后将其关闭，可以增加修复准确度。")
+        # 如果任何一步运行失败，那么就短路返回 False
+        # 应 Silverteal 意见，加一个注释（
         return self.ask_minecraft() and self.ask_version() and self.ask_save()
 
 
