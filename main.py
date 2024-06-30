@@ -7,7 +7,7 @@ import datetime
 import json
 import os
 from pathlib import Path
-import re
+from typing import Union
 import uuid
 
 
@@ -72,6 +72,9 @@ class Minecraft:
     def __iter__(self):
         return (Version(v) for v in self.versions.iterdir())
 
+    def __str__(self):
+        return "未开启版本隔离"
+
     @property
     def versions(self):
         """
@@ -135,11 +138,9 @@ class Saves:
 
     def __iter__(self):
         if not self.path.is_dir():
-            raise FileNotFoundError(f"错误：未找到 saves 文件夹：{self.path}")
+            print(f"错误：未找到 saves 文件夹：{self.path}")
+            return (s for s in [])
         return (Save(s) for s in self.path.iterdir())
-
-    def __str__(self) -> str:
-        return "未开启版本隔离"
 
 
 class SaveFixError(Exception):
@@ -156,6 +157,10 @@ class SaveFixError(Exception):
 
     def __str__(self) -> str:
         return f"修复 {self.save} 失败：{self.msg}"
+
+
+TOFIX_JSON = ["advancements", "stats"]
+TOFIX_DAT = ["playerdata"]
 
 
 class Save:
@@ -176,18 +181,36 @@ class Save:
         if not self.path.is_dir():
             raise FileNotFoundError(f"错误：未找到存档文件夹：{self.path}")
         print(f"正在修复存档：{self.path}")
-        adv_json = latest_modified(self.path / "advancements")
-        if not adv_json:
-            print("该存档不需要修复！")
-            return
-        if adv_json and adv_json.suffix != ".json":
-            raise SaveFixError(f"存档中可能有个人文件，修复失败（{adv_json}）。", self)
-        adv_json.rename(adv_json.parent / f"{new_uuid}.json")
-        print(f"{adv_json} -> {adv_json.parent / f'{new_uuid}.json'}")
-        print("修复成功！")
+
+        for d in TOFIX_JSON:
+            dat_file = latest_modified(self.path / d)
+            if not dat_file:
+                continue
+            if dat_file.suffix != ".json":
+                print(f"存档中可能有个人文件，已跳过（{dat_file}）。")
+            if dat_file.name == f"{new_uuid}.json":
+                continue
+            dat_file.rename(dat_file.parent / f"{new_uuid}.json")
+            print(f"{dat_file} -> {new_uuid}.json")
+
+        for d in TOFIX_DAT:
+            dat_file = latest_modified(self.path / d)
+            if not dat_file:
+                continue
+            if dat_file.suffix != ".dat":
+                print(f"存档中可能有个人文件，已跳过（{dat_file}）。")
+            if dat_file.name == f"{new_uuid}.dat":
+                continue
+            dat_file.rename(dat_file.parent / f"{new_uuid}.dat")
+            print(f"{dat_file} -> {new_uuid}.dat")
+
+        print("修复完成！")
 
     def __str__(self) -> str:
         return self.path.name
+
+
+# POSSIBLE_BATCH = ["../PCL/LatestLaunch.bat"]
 
 
 class UuidReader:
@@ -195,39 +218,32 @@ class UuidReader:
     读取 UUID。
     """
 
-    POSSIBLE_BATCH = ["../PCL/LatestLaunch.bat"]
     possible_uuid = []
 
-    def __init__(self, mc_path: Path, usercache: Path) -> None:
-        self.mc_path = mc_path
-        self.usercache = usercache
+    def __init__(self, version: Path, player_id: str) -> None:
+        print(version)
+        self.version = version
+        self.player_id = player_id
+
+    def usercache(self):
+        """
+        获取 usercache.json 文件的内容。
+        """
+        with (self.version / "usercache.json").open("r", encoding="utf-8") as f:
+            if result := json.load(f):
+                yield result
 
     def read(self):
         """
         读取 UUID。
         """
-        for p in self.POSSIBLE_BATCH:
-            if not (path := self.mc_path / p).is_file():
-                continue
-            with open(path, "r", encoding="ansi") as f:
-                content = f.read()
-            match = re.search(r"--uuid\s+(\S+)", content)
-            if not match:
-                continue
-            self.possible_uuid.append((u := match[0].replace("--uuid", "").strip()))
-            print(f"[UUID] 从启动脚本获取到的 UUID：{u}")
-        if self.usercache.is_file():
-            with open(self.usercache, "r", encoding="utf-8") as f:
-                content = json.load(f)
-            if isinstance(content, dict):
-                self.possible_uuid.append(
-                    *(
-                        d["uuid"]
-                        for d in content
-                        if datetime.datetime.fromisoformat(d["expiresOn"])
-                        > datetime.datetime.now()
-                    )
-                )
+        usercache = self.usercache()
+        for player in usercache:
+            if not isinstance(expire := player["expiresOn"], str):
+                assert False, "expiresOn 不是字符串"
+            expire = datetime.datetime.fromisoformat(expire.split("+")[0].strip())
+            if player["name"] == self.player_id and expire > datetime.datetime.now():
+                self.possible_uuid.append(player["uuid"])
         print("[UUID] 读取到的 UUID：", self.possible_uuid)
         common = Counter(self.possible_uuid).most_common(1)
         if not common:
@@ -238,7 +254,7 @@ class UuidReader:
         """
         格式化 UUID。
         """
-        print(uuid_input, str(uuid.UUID(uuid_input)).lower())
+        # print(uuid_input, str(uuid.UUID(uuid_input)).lower())
         return str(uuid.UUID(uuid_input)).lower()
 
 
@@ -265,9 +281,10 @@ class Logic:
         """
         让用户选择游戏版本。
         """
-        version_list = ([self.mc.saves] if self.mc.saves.path.is_dir() else []) + list(
-            self.mc
+        version_list: list[Union[Version, Minecraft]] = (
+            list(self.mc) if (self.mc.path / "versions").is_dir() else []
         )
+        version_list.append(self.mc)
         if len(version_list) == 0:
             print("没有游戏版本。")
             return False
@@ -278,12 +295,14 @@ class Logic:
         if not result:
             print("未知的游戏版本。")
             return False
-        if isinstance(result, Saves):
+        if isinstance(result, Minecraft):
             # 没开版本隔离
-            self.saves = result
+            self.saves = result.saves
         elif isinstance(result, Version):
             # 版本隔离了
             self.saves = result.saves
+        else:
+            assert False, "错误：未知的游戏版本类型。"
         return True
 
     saves: Saves
@@ -296,17 +315,17 @@ class Logic:
         if len(saves_list := list(self.saves)) == 0:
             print("没有存档。")
             return False
-        result = askfor_select(saves_list, "请选择存档")
-        if not result:
+        save = askfor_select(saves_list, "请选择存档")
+        if not save:
             print("未知的存档。")
             return False
-        if not isinstance(result, Save):
+        if not isinstance(save, Save):  # 骗 linter
             return False
-        result.fix(
-            UuidReader(
-                self.mc.path, result.path / ".." / ".." / "usercache.json"
-            ).read()
-        )
+        playerid = input("请输入游戏 ID：")
+        if not playerid:
+            print("游戏 ID 不能为空。")
+            return False
+        save.fix(UuidReader(self.saves.path.parent, playerid).read())
         return True
 
     def run_all(self):
